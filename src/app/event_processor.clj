@@ -1,10 +1,8 @@
 (ns app.event-processor
-  "Processes events: stores in SQLite and applies projections to the todos table.
-
-   Both operations happen in the same SQLite transaction via jdbc/with-transaction."
+  "Processes events: appends them to the S3 event store and applies projections
+   to the SQLite todos table."
   (:require [app.event-store :as store]
             [app.projections.core :as proj]
-            [app.db-schema :as schema]
             [next.jdbc :as jdbc]
             [honey.sql :as sql]))
 
@@ -14,28 +12,23 @@
    Takes world-map w with :db/ds (datasource).
    Takes command-result which is {:ok events} or {:error msg}.
 
-   Both event storage and projection happen in the same transaction,
-   ensuring atomicity across the event store and read-model."
+   Events are appended before projections. If projection fails, the S3 event
+   store remains the source of truth and the read-model can be rebuilt by replay."
   [w command-result]
   (if-let [events (:ok command-result)]
-    (let [tx-id (random-uuid)
-          user-id nil
-          events-with-meta (mapv #(assoc %
-                                         :event/tx-id tx-id
-                                         :event/user-id user-id)
-                                 events)
-          ds (:db/ds w)
+    (let [ds (:db/ds w)
           projection-lookup (proj/build-projection-lookup
                               ((:system/get-register w)))]
 
-      (jdbc/with-transaction [tx ds]
-        ;; 1. Store events
-        (doseq [event events-with-meta]
-          (store/store-event! tx event))
+      ;; 1. Store events durably. This is intentionally outside the SQLite
+      ;; transaction because the event store is now the source of truth.
+      (when (seq events)
+        (store/append-events! events))
 
-        ;; 2. Apply projections
+      ;; 2. Apply projections.
+      (jdbc/with-transaction [tx ds]
         (let [stmts (vec (mapcat (partial proj/apply-event projection-lookup)
-                                 events-with-meta))]
+                                 events))]
           (doseq [stmt stmts]
             (jdbc/execute! tx (sql/format stmt)))))
 
@@ -43,7 +36,7 @@
       (assoc w
              :command/result {:success? true
                               :aggregate-id (:aggregate-id command-result)}
-             :event-processor/events events-with-meta))
+             :event-processor/events events))
 
     ;; Error case - no events to process
     (assoc w
@@ -51,10 +44,10 @@
                             :error (:error command-result)})))
 
 (defn replay-all-events!
-  "Rebuild todos read-model by replaying all events from SQLite.
+  "Rebuild todos read-model by replaying all events from the S3 event store.
 
    DESTRUCTIVE: Drops the todos table and rebuilds it from events.
-   All operations happen in a single SQLite transaction.
+   Read-model writes happen in a single SQLite transaction.
 
    Returns {:replayed count}.
 
@@ -67,7 +60,7 @@
   ([ds projection-lookup]
    (jdbc/with-transaction [tx ds]
      ;; Read events first
-     (let [events (store/get-all-events tx)]
+     (let [events (store/get-all-events)]
 
        ;; Drop and recreate todos table
        (store/drop-todos-table! tx)

@@ -1,34 +1,97 @@
 (ns app.event-store
-  "Event store using SQLite via next.jdbc.
+  "S3-backed event store.
 
-   Events are stored as EDN blobs. The table only has sequence_num (ordering),
-   id (dedup), and data (the full event as EDN). Any queryable indexes on
-   event fields would be separate read-model projections."
-  (:require [clojure.edn :as edn]
-            [next.jdbc :as jdbc]
-            [next.jdbc.result-set :as rs]))
+   Events are appended in commits using simplemono.eventstore.s3. SQLite is still used for
+   read-model projections, but events are the source of truth and live in a
+   Tigris Data bucket."
+  (:require [clojure.string :as str]
+            [simplemono.eventstore.protocols :as es]
+            [simplemono.eventstore.s3 :as s3]
+            [simplemono.eventstore.s3-packs :as s3-packs]
+            [next.jdbc :as jdbc]))
 
-(defn store-event!
-  "Store an event. The connectable can be a datasource or transaction."
-  [connectable event]
-  (jdbc/execute! connectable
-    ["INSERT INTO events (id, data) VALUES (?, ?)"
-     (str (:event/id event))
-     (pr-str event)]))
+(defn- env
+  [k]
+  (let [v (System/getenv k)]
+    (when-not (str/blank? v)
+      v)))
 
-(defn- parse-event
-  "Parse a row into an event map."
-  [row]
-  (let [event (edn/read-string (:data row))]
-    (assoc event :event/sequence-num (:sequence_num row))))
+(defn- event-store-config
+  []
+  (let [bucket (env "EVENT_STORE_BUCKET")]
+    (when (str/blank? bucket)
+      (throw (ex-info "Missing S3 event-store bucket"
+                      {:required-env "EVENT_STORE_BUCKET"})))
+    (cond-> {:bucket bucket
+             :prefix (or (env "EVENT_STORE_PREFIX") "todo")}
+      (env "EVENT_STORE_ENDPOINT")
+      (assoc :endpoint (env "EVENT_STORE_ENDPOINT"))
+
+      (env "EVENT_STORE_REGION")
+      (assoc :region (env "EVENT_STORE_REGION"))
+
+      (env "EVENT_STORE_ACCESS_KEY_ID")
+      (assoc :access-key-id (env "EVENT_STORE_ACCESS_KEY_ID")
+             :secret-access-key (env "EVENT_STORE_SECRET_ACCESS_KEY")))))
+
+(defonce config
+  (delay (event-store-config)))
+
+(defonce client
+  (delay
+    (s3/client (select-keys @config [:endpoint
+                                     :region
+                                     :access-key-id
+                                     :secret-access-key]))))
+
+(defn- store-options
+  []
+  {:client @client
+   :bucket (:bucket @config)
+   :prefix (:prefix @config)
+   :headers {"X-Tigris-Consistent" "true"}})
+
+(defonce store
+  (delay
+    (s3/store (store-options))))
+
+(defonce replay-store
+  (delay
+    (s3-packs/store (store-options))))
+
+(defn- next-commit-number
+  []
+  (if-some [latest (es/latest-commit-number @store)]
+    (inc latest)
+    0))
+
+(defn append-events!
+  "Append events as a single commit and return the stored commit.
+
+   If another writer wins the chosen commit number, retry with the new head."
+  [events]
+  (let [commit {:commit/id (random-uuid)
+                :commit/created-at (java.util.Date.)
+                :commit/events (vec events)}]
+    (loop []
+      (let [commit-number (next-commit-number)]
+        (if (es/try-append! @store commit-number commit)
+          (assoc commit :commit/number commit-number)
+          (recur))))))
+
+(defn pack-completed-ranges!
+  "Create any missing full 1000-commit S3 packs for faster replay."
+  []
+  (s3-packs/pack-completed-ranges! (store-options) @store))
 
 (defn get-all-events
-  "Get all events in order."
-  [connectable]
-  (mapv parse-event
-        (jdbc/execute! connectable
-          ["SELECT * FROM events ORDER BY sequence_num"]
-          {:builder-fn rs/as-unqualified-maps})))
+  "Get all events in commit order using the pack-aware replay store."
+  []
+  (if-some [latest (es/latest-commit-number @replay-store)]
+    (->> (range 0 (inc latest))
+         (mapcat #(:commit/events (es/get-commit @replay-store %)))
+         vec)
+    []))
 
 (defn drop-todos-table!
   "Drop the todos table for replay. Used when rebuilding the read-model."
