@@ -3,6 +3,7 @@
             [next.jdbc.result-set :as rs]
             [honey.sql :as sql]
             [app.part :as part]
+            [app.event-processor :as event-processor]
             [app.commands.todo :as cmd]
             [app.projections.todo :as proj]))
 
@@ -21,9 +22,11 @@
                          rows)})))
 
 (defn prepare
-  "Prepare world-map with datasource."
+  "Prepare world-map with a caught-up SQLite read model."
   [w]
-  (part/add-ds w))
+  (let [w (part/add-ds w)]
+    (event-processor/catch-up! (:db/ds w) ((:system/get-register w)))
+    w))
 
 (def register
   [{:query/kind :query/todos
@@ -38,6 +41,7 @@
    {:command/kind :command/delete-todo
     :command/fn (comp (part/execute-command! #'cmd/delete-todo)
                       prepare)}
+   {:projection/create #'proj/create-todos}
    {:projection/event-kind :todo/created
     :projection/fn #'proj/todo-created}
    {:projection/event-kind :todo/completed

@@ -5,12 +5,12 @@
             [app.system.register :as system-register]
             [parts.httpkit.server :as httpkit]
             [app.db :as db]
-            [app.db-schema :as schema])
+            [app.event-processor :as event-processor])
   (:gen-class))
 
 (defn start!
   []
-  (schema/ensure-schema! (db/get-ds))
+  (event-processor/catch-up! (db/get-ds) (system-register/get-register))
   (let [nrepl-server (nrepl/start-server
                        :bind "0.0.0.0"
                        :port 4000

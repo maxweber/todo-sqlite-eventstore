@@ -6,7 +6,9 @@
 (defonce datasource
   (atom nil))
 
-(def db-file "data/db.db")
+(def projection-version 1)
+
+(def db-file (str "data/db-v" projection-version ".db"))
 
 (defn get-ds
   "Gets or creates the datasource."

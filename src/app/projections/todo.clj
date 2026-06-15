@@ -1,6 +1,13 @@
 (ns app.projections.todo
   "Projections for todo events - transform events to honeysql statements.")
 
+(defn create-todos
+  []
+  [{:create-table [:todos :if-not-exists]
+    :with-columns [[:id :text [:primary-key]]
+                   [:text :text [:not nil]]
+                   [:completed :integer [:not nil] [:default 0]]]}])
+
 (defn todo-created
   [event]
   (let [{:keys [id text]} (:event/data event)]

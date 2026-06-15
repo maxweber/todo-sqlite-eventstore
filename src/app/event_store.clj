@@ -1,14 +1,12 @@
 (ns app.event-store
   "S3-backed event store.
 
-   Events are appended in commits using simplemono.eventstore.s3. SQLite is still used for
-   read-model projections, but events are the source of truth and live in a
-   Tigris Data bucket."
+   Events are appended in commits using the pack-aware S3 EventStore. SQLite is
+   used only for read-model projections; events are the source of truth."
   (:require [clojure.string :as str]
             [simplemono.eventstore.protocols :as es]
             [simplemono.eventstore.s3 :as s3]
-            [simplemono.eventstore.s3-packs :as s3-packs]
-            [next.jdbc :as jdbc]))
+            [simplemono.eventstore.s3-packs :as s3-packs]))
 
 (defn- env
   [k]
@@ -53,10 +51,6 @@
 
 (defonce store
   (delay
-    (s3/store (store-options))))
-
-(defonce replay-store
-  (delay
     (s3-packs/store (store-options))))
 
 (defn- next-commit-number
@@ -83,17 +77,3 @@
   "Create any missing full 1000-commit S3 packs for faster replay."
   []
   (s3-packs/pack-completed-ranges! (store-options) @store))
-
-(defn get-all-events
-  "Get all events in commit order using the pack-aware replay store."
-  []
-  (if-some [latest (es/latest-commit-number @replay-store)]
-    (->> (range 0 (inc latest))
-         (mapcat #(:commit/events (es/get-commit @replay-store %)))
-         vec)
-    []))
-
-(defn drop-todos-table!
-  "Drop the todos table for replay. Used when rebuilding the read-model."
-  [connectable]
-  (jdbc/execute! connectable ["DROP TABLE IF EXISTS todos"]))

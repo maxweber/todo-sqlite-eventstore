@@ -14,8 +14,11 @@
   com.github.seancorfield/honeysql {:mvn/version "2.6.1230"}
   org.xerial/sqlite-jdbc {:mvn/version "3.47.1.0"}
   simplemono/eventstore-s3-packs {:git/url "https://github.com/simplemono/eventstore.git"
-                                  :sha "caa7540d7be50d7f8fff3510b6e418190cb44f8f"
+                                  :sha "4deabc4f3bdbf723d68bd211dd689086675986e4"
                                   :deps/root "s3-packs"}
+  simplemono/sqlite-event-projection {:git/url "https://github.com/simplemono/sqlite-event-projection.git"
+                                      :sha "4d383352016c45637d8c05ac3695d0cd870ffb0b"
+                                      :exclusions [simplemono/eventstore-protocols]}
   simplemono.parts/replicant {:git/url "https://github.com/simplemono/parts.git"
                               :sha "e14947ec42e252b871ec0b451bd66a7045884991"
                               :deps/root "replicant"}

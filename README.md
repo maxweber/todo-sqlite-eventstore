@@ -1,10 +1,8 @@
 # Todo app with an S3 event store and SQLite read model
 
 A basic todo app that stores events in Tigris Data and uses SQLite for the
-projected todos read model. Events are the source of truth; the todos table is
-rebuilt from projections.
-
-Mostly written by Claude Code.
+projected todos read model. Events are the source of truth; the SQLite DB is
+derived state.
 
 ## Why
 
@@ -14,24 +12,23 @@ worse, they store the computed result instead of the formula itself. It's
 immediately obvious that this is something you want to avoid.
 
 Event sourcing separates the two. Events are immutable values, stored forever.
-The read-model (todos table) is derived state. If you later discover that a
-projection was wrong, you can delete the read-model and replay all events to
-rebuild it in a single SQLite transaction.
+The read model is derived state. If a projection changes, build a new SQLite DB
+from the event stream and switch to it when it is ready.
 
 Events also force you to assign a meaning to what happened. Transactions in
 relational databases can be fairly arbitrary. External event streams, such as
 those from [a billing
 provider](https://developer.paddle.com/api-reference/events/list-events), make
-this especially clear: you can build your own read-model and keep it up to date
+this especially clear: you can build your own read model and keep it up to date
 simply by applying new events as they arrive.
 
 ## Architecture
 
 ### Event store
 
-Events are appended as EDN commits to a Tigris Data bucket using the public
-[`simplemono/eventstore`](https://github.com/simplemono/eventstore) library's
-`simplemono.eventstore.s3` module. SQLite only stores derived read-model data.
+Events are appended as EDN commits to a Tigris Data bucket using
+[`simplemono/eventstore`](https://github.com/simplemono/eventstore)'s
+pack-aware `simplemono.eventstore.s3-packs` module.
 
 Object keys use the configured stream prefix:
 
@@ -43,53 +40,79 @@ Commit `0` is stored as `9223372036854775807`, commit `1` as
 `9223372036854775806`, and so on. This makes the latest commit sort first in
 LIST results. Requests include `X-Tigris-Consistent: true`.
 
-Replay uses `simplemono.eventstore.s3-packs`, the optional pack-aware replay
-store from the same library. Full 1000-commit packs live under:
-
-```text
-{EVENT_STORE_PREFIX}/packs/{inverted-pack-index-019d}
-```
-
-The app can create missing full packs from the REPL:
+The same EventStore value is used for appends and replay. It writes normal S3
+commit objects and reads from immutable 1000-commit packs when packs exist,
+falling back to commit objects for the unpacked tail. Missing full packs can be
+created from the REPL:
 
 ```clojure
 (app.event-store/pack-completed-ranges!)
 ```
 
+### SQLite projections
+
+SQLite projection tables are maintained by
+[`simplemono/sqlite-event-projection`](https://github.com/simplemono/sqlite-event-projection).
+The app catches SQLite up from the EventStore before queries and after command
+writes. This keeps the read model current even when more than one process writes
+to the same event stream.
+
+The SQLite DB file includes the projection version:
+
+```text
+data/db-v1.db
+```
+
+When projection logic or schema changes, bump `app.db/projection-version` and
+build a new DB file from the event stream instead of mutating the old one.
+
 ### Data-driven registration
 
-Queries, commands, and projections are all registered as data maps in a single
-register:
+Queries, commands, projection schema, and projection handlers are registered as
+data maps:
 
 ```clojure
 ;; in app.todo
 (def register
-  [{:query/kind     :query/todos      :query/fn #'query-todos}
-   {:command/kind   :command/add-todo  :command/fn ...}
-   {:projection/event-kind :todo/created  :projection/fn #'proj/todo-created}
+  [{:query/kind :query/todos
+    :query/fn #'query-todos}
+   {:command/kind :command/add-todo
+    :command/fn ...}
+   {:projection/create #'proj/create-todos}
+   {:projection/event-kind :todo/created
+    :projection/fn #'proj/todo-created}
    ...])
 ```
 
 ### Processing flow
 
 1. Browser sends a command via `/command`
-2. Command handler (pure function) returns `{:ok [events]}` or `{:error msg}`
-3. Events are appended to the S3 event store
-4. Projections update the SQLite read-model
-5. Queries read from the projected todos table
+2. The app catches SQLite up from the EventStore
+3. Command handler reads the SQLite read model and returns `{:ok [events]}` or
+   `{:error msg}`
+4. Events are appended to the S3 event store
+5. The app catches SQLite up again so this process observes its own write
+6. Queries catch SQLite up before reading from the projected todos table
 
-### Replay
+### Rebuild
 
-Rebuild the read-model from scratch at the REPL:
+Build a new SQLite DB file from the event stream at the REPL:
 
 ```clojure
-(app.event-processor/replay-all-events! (app.db/get-ds))
+(require '[simplemono.sqlite-event-projection :as projection]
+         '[app.db :as db]
+         '[app.event-store :as event-store]
+         '[app.system.register :as register])
+
+(projection/build-db-file! {:event-store @event-store/store
+                            :db/path "data/db-v2.db"
+                            :projection/version 2
+                            :projection/register (register/get-register)})
 ```
 
-This drops the todos table and replays every event through the projections,
-with the read-model rebuild in one SQLite transaction. The replay path uses the
-pack-aware event store and falls back to individual commit objects for the
-unpacked tail.
+Switch the app to the new file by bumping `app.db/projection-version` and
+restarting. Rollback means switching back to the old versioned DB file and
+catching it up from the EventStore.
 
 ## Tigris Data configuration
 
